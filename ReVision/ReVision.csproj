@@ -1,0 +1,29 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <PublishAot>true</PublishAot>
+        <InvariantGlobalization>true</InvariantGlobalization>
+        <TrimmerRemoveSymbols>true</TrimmerRemoveSymbols>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\ReVision.EyeDevice\ReVision.EyeDevice.csproj" />
+      <ProjectReference Include="..\ReVision.KeyWarning\ReVision.KeyWarning.csproj" />
+      <ProjectReference Include="..\ReVision.Streamer\ReVision.Streamer.csproj" />
+      <ProjectReference Include="..\ReVision.Vive\ReVision.Vive.csproj" />
+
+      <Content Condition="$([System.OperatingSystem]::IsWindows())" Include="$(VCPKG_ROOT)/installed/x64-windows/bin/libusb-1.0.dll">
+          <TargetPath>%(Filename)%(Extension)</TargetPath>
+          <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      </Content>
+      <Content Condition="$([System.OperatingSystem]::IsWindows())" Include="$(VCPKG_ROOT)/installed/x64-windows/bin/hidapi.dll">
+          <TargetPath>%(Filename)%(Extension)</TargetPath>
+          <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      </Content>
+    </ItemGroup>
+
+</Project>
