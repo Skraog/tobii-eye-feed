@@ -1,4 +1,4 @@
-﻿namespace ReVision.EyeDevice.Platform;
+namespace ReVision.EyeDevice.Platform;
 
 public enum DataLength : uint
 {

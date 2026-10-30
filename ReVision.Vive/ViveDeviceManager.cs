@@ -1,68 +1,87 @@
-﻿using HidApi;
-using LibUsbDotNet.Info;
+using HidApi;
 using LibUsbDotNet.LibUsb;
-using LibUsbDotNet.Main;
 
 namespace ReVision.Vive;
 
-public class ViveDeviceManager : IDisposable
+public sealed class ViveDeviceManager : IAsyncDisposable
 {
-    private CancellationTokenSource _cancellationTokenSource;
-    private CancellationToken _cancellationToken;
+    private readonly UsbContext _context;
+    private readonly CancellationTokenSource _stop;
+    private readonly Dictionary<string, ViveDevice> _devices = new();
+    private readonly Dictionary<string, DateTimeOffset> _retryAfter = new();
+    private readonly Task _monitor;
 
-    private UsbContext _usbContext;
-    private DeviceManager _deviceManager;
-    private UsbDeviceFinder _usbDeviceFinder;
-    
-    private List<ViveDevice> _devices;
-    
-    public ViveDeviceManager(CancellationToken linkedCancellationToken)
+    public ViveDeviceManager(CancellationToken token)
     {
-        _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(linkedCancellationToken);
-        _cancellationToken = _cancellationTokenSource.Token;
-
-        _usbContext = new UsbContext();
-        _deviceManager = new DeviceManager(_usbContext);
-        _usbDeviceFinder = new UsbDeviceFinder
-        {
-            Vid = 0x0BB4,
-            Pid = 0x0309
-        };
-
-        _devices = new List<ViveDevice>();
-        
-        _deviceManager.Start();
-        Task.Run(DetectNewDevice, _cancellationToken);
+        // Check the native dependency before allocating owned resources.
+        _ = Hid.VersionString();
+        _context = new UsbContext();
+        _stop = CancellationTokenSource.CreateLinkedTokenSource(token);
+        _monitor = Task.Run(MonitorAsync);
     }
 
-    private async Task DetectNewDevice()
-    {
-        var usbArrivalToken = CancellationTokenSource.CreateLinkedTokenSource(_cancellationToken).Token;
-        UsbDevice? usbDevice = await _deviceManager.WaitForDeviceArrival(_usbDeviceFinder, TimeSpan.FromSeconds(30), usbArrivalToken, TimeSpan.FromMilliseconds(500));
-        
-        while (!_cancellationToken.IsCancellationRequested)
-        {
-            usbArrivalToken = CancellationTokenSource.CreateLinkedTokenSource(_cancellationToken).Token;
-            usbDevice ??= await _deviceManager.WaitForNewDeviceArrival(_usbDeviceFinder, TimeSpan.FromSeconds(30), usbArrivalToken, TimeSpan.FromMilliseconds(500));
+    public Task Completion => _monitor;
 
-            if (usbDevice == null)
-                continue;
-            
-            usbDevice.Open();
-            var deviceSn = usbDevice.Info.SerialNumber;
-            usbDevice.Close();
-            
-            var hidDevice = new Device(usbDevice.VendorId, usbDevice.ProductId, deviceSn);
-            _devices.Add(new ViveDevice(hidDevice, deviceSn, _cancellationToken));
-            
-            usbDevice = null;
+    private async Task MonitorAsync()
+    {
+        try
+        {
+            while (!_stop.IsCancellationRequested)
+            {
+                using var connected = _context.List();
+                var present = new HashSet<string>();
+                foreach (var usb in connected.OfType<UsbDevice>().Where(d => d.VendorId == 0x0bb4 && d.ProductId == 0x0309))
+                {
+                    string id = $"{usb.BusNumber}:{usb.Address}";
+                    present.Add(id);
+                    if (_devices.TryGetValue(id, out var failed) && failed.HasFailed)
+                    {
+                        _devices.Remove(id);
+                        await failed.DisposeAsync();
+                        _retryAfter[id] = DateTimeOffset.UtcNow.AddSeconds(5);
+                    }
+                    if (_devices.ContainsKey(id) || (_retryAfter.TryGetValue(id, out var retry) && retry > DateTimeOffset.UtcNow)) continue;
+                    try
+                    {
+                        usb.Open();
+                        string serial;
+                        try { serial = usb.Info.SerialNumber; }
+                        finally { usb.Close(); }
+                        if (string.IsNullOrEmpty(serial)) throw new IOException("Vive USB serial descriptor is empty.");
+                        var hid = new Device(usb.VendorId, usb.ProductId, serial);
+                        _devices[id] = new ViveDevice(hid, serial, _stop.Token);
+                        _retryAfter.Remove(id);
+                        Console.WriteLine($"Vive {id}: HID keep-alive started.");
+                    }
+                    catch (Exception error)
+                    {
+                        _retryAfter[id] = DateTimeOffset.UtcNow.AddSeconds(5);
+                        Console.Error.WriteLine($"Vive {id}: {error.Message}. Check USB/hidraw permissions; retrying in five seconds.");
+                    }
+                }
+                foreach (string id in _devices.Keys.Where(id => !present.Contains(id)).ToArray())
+                {
+                    var device = _devices[id];
+                    _devices.Remove(id);
+                    _retryAfter.Remove(id);
+                    await device.DisposeAsync();
+                }
+                await Task.Delay(1000, _stop.Token);
+            }
         }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
-        _cancellationTokenSource.Dispose();
-        _deviceManager.Dispose();
-        _usbContext.Dispose();
+        _stop.Cancel();
+        try { await _monitor; }
+        catch (Exception error) { Console.Error.WriteLine($"Vive monitor stopped: {error.Message}"); }
+        finally
+        {
+            foreach (var device in _devices.Values) await device.DisposeAsync();
+            _context.Dispose();
+            _stop.Dispose();
+        }
     }
 }

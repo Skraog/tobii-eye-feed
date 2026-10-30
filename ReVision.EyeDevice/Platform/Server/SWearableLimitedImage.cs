@@ -1,10 +1,10 @@
-﻿namespace ReVision.EyeDevice.Platform.Server;
+namespace ReVision.EyeDevice.Platform.Server;
 
 public class SWearableLimitedImage : BasePacket
 {
     public long TimestampTrackerUs { get; private set; }
-    public RegionGroupConfig[] GroupConfigs { get; private set; }
-    public LedConfig[] LedConfigs { get; private set; }
+    public RegionGroupConfig[] GroupConfigs { get; private set; } = [];
+    public LedConfig[] LedConfigs { get; private set; } = [];
     public List<byte[]> ImageData { get; } = new();
 
     public SWearableLimitedImage(Stream stream) : base(stream)
@@ -14,7 +14,8 @@ public class SWearableLimitedImage : BasePacket
 
         while (rowCount > currentRow)
         {
-            switch (this.DecodeTreeColumn(PrologueType.TREE_XDS_COLUMN))
+            uint column = this.DecodeTreeColumn(PrologueType.TREE_XDS_COLUMN);
+            switch (column)
             {
                 case (uint)WearableColumnType.TIMESTAMP_TRACKER_US:
                     TimestampTrackerUs = this.DecodeI64();
@@ -60,22 +61,26 @@ public class SWearableLimitedImage : BasePacket
                     break;
                 case (uint)WearableColumnType.IMAGE_DATA:
                     ImageData.Add(this.DecodeBlob());
+                    if (ImageData.Count > 16) throw new InvalidDataException("Too many images in one packet.");
                     break;
+                default:
+                    throw new InvalidDataException($"Unsupported image column: {column}.");
             }
 
             currentRow++;
         }
     }
-    
+
     private RegionGroupConfig[] DecodeRegionGroupConfig()
     {
         var (entryCount, _) = this.DecodeTreeList();
+        if (entryCount > 16) throw new InvalidDataException("Too many image regions.");
         RegionGroupConfig[] results = new RegionGroupConfig[entryCount];
 
         for (int i = 0; i < entryCount; i++)
         {
             var prologue = this.DecodePrologue();
-            
+
             if (prologue != (uint)PrologueType.EXTENDED_DATA_STREAM_GROUP_CONFIG)
                 throw new InvalidDataException($"Expected type {(uint)PrologueType.EXTENDED_DATA_STREAM_GROUP_CONFIG} but got {prologue}");
 
@@ -95,16 +100,17 @@ public class SWearableLimitedImage : BasePacket
 
         return results;
     }
-    
+
     private LedConfig[] DecodeLedConfig()
     {
         var (entryCount, _) = this.DecodeTreeList();
+        if (entryCount > 64) throw new InvalidDataException("Too many LED configurations.");
         LedConfig[] results = new LedConfig[entryCount];
 
         for (int i = 0; i < entryCount; i++)
         {
             var prologue = this.DecodePrologue();
-            
+
             if (prologue != (uint)PrologueType.EXTENDED_DATA_STREAM_LED_CONFIG)
                 throw new InvalidDataException($"Expected type {(uint)PrologueType.EXTENDED_DATA_STREAM_LED_CONFIG} but got {prologue}");
 

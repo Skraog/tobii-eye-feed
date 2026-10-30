@@ -1,18 +1,16 @@
-﻿namespace ReVision.EyeDevice.Platform.Client;
+namespace ReVision.EyeDevice.Platform.Client;
 
 public class CUpgradeProtocol : BasePacket, IBinaryOutput
 {
-    private uint[] _targetProtocolVersions;
-    
+    private readonly uint[] _targetProtocolVersions;
+
     internal CUpgradeProtocol(uint messageId, uint[] targetProtocolVersions) : base(messageId, OpCode.PROTOCOL_UPGRADE)
     {
         _targetProtocolVersions = targetProtocolVersions;
     }
 
-    public bool Encode()
+    void IBinaryOutput.WriteBody()
     {
         this.EncodeUInt32Vector(_targetProtocolVersions);
-        
-        return true;
     }
 }

@@ -1,121 +1,79 @@
-﻿using System.IO.Hashing;
-using System.Runtime.InteropServices;
+using System.Buffers.Binary;
+using System.IO.Hashing;
 using System.Text;
 using HidApi;
 
 namespace ReVision.Vive;
 
-public class ViveDevice
+public sealed class ViveDevice : IAsyncDisposable
 {
-    private CancellationTokenSource _cancellationTokenSource;
-    private CancellationToken _cancellationToken;
-    
-    private Device _device;
-    private Crc32 _crc;
-    private byte[] _deviceSerialNumber;
+    private readonly Device _device;
+    private readonly CancellationTokenSource _stop;
+    private readonly Task _worker;
+    private int _failed;
+    public bool HasFailed => Volatile.Read(ref _failed) != 0;
 
-    public ViveDevice(Device device, string deviceSn, CancellationToken linkedCancellationToken)
+    public ViveDevice(Device device, string serialNumber, CancellationToken token)
     {
         _device = device;
-        _crc = new Crc32();
-        _deviceSerialNumber = Encoding.UTF8.GetBytes(deviceSn);
-        
-        _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(linkedCancellationToken);
-        _cancellationToken = _cancellationTokenSource.Token;
-
-        Task.Run(EnableEyeChip);
+        _stop = CancellationTokenSource.CreateLinkedTokenSource(token);
+        byte[] serial = Encoding.UTF8.GetBytes(serialNumber);
+        _worker = Task.Factory.StartNew(() => KeepAlive(serial), CancellationToken.None,
+            TaskCreationOptions.LongRunning, TaskScheduler.Default);
     }
 
-    private async Task EnableEyeChip()
+    // Offsets and CRC transformation are inherited from the upstream Vive control protocol.
+    public static byte[] CreateKeepAlive(ReadOnlySpan<byte> serial, ushort authorizationId)
     {
-        while (!_cancellationToken.IsCancellationRequested)
+        if (serial.Length is < 1 or > 256) throw new ArgumentOutOfRangeException(nameof(serial));
+        Span<byte> challenge = stackalloc byte[serial.Length + 2];
+        serial.CopyTo(challenge);
+        BinaryPrimitives.WriteUInt16LittleEndian(challenge[serial.Length..], authorizationId);
+        uint crc = Crc32.HashToUInt32(challenge);
+        byte[] report = new byte[64];
+        report[0] = 0x04;
+        BinaryPrimitives.WriteUInt16LittleEndian(report.AsSpan(1), 0x2978);
+        report[3] = 0x38;
+        report[10] = 0x08;
+        report[47] = (byte)((crc >> 25) | 0x80);
+        report[48] = (byte)(crc >> 17);
+        report[49] = (byte)(crc >> 9);
+        return report;
+    }
+
+    private void KeepAlive(byte[] serial)
+    {
+        try
         {
-            try
+            while (!_stop.IsCancellationRequested)
             {
-                bool hasValidStatus = false;
-                ViveControl viveControl = default;
-
-                for (int i = 0; i < 10; ++i)
+                ReadOnlySpan<byte> report = _device.ReadTimeout(64, 500);
+                ushort? latestChallenge = null;
+                for (int i = 0; report.Length > 0 && i < 128; i++)
                 {
-                    if (_cancellationToken.IsCancellationRequested)
-                        return;
-
-                    var hidReport = _device.Read(64);
-
-                    if (hidReport.Length != 64)
-                        throw new ArgumentOutOfRangeException();
-
-                    var parsedViveControl = MemoryMarshal.Read<ViveControl>(hidReport);
-
-                    if (parsedViveControl.ReportId != 0x03)
-                        continue;
-
-                    if (parsedViveControl.Command != 0x2CD0)
-                        continue;
-                
-                    viveControl = parsedViveControl;
-                    hasValidStatus = true;
+                    if (report.Length == 64 && report[0] == 0x03 && BinaryPrimitives.ReadUInt16LittleEndian(report[1..]) == 0x2cd0)
+                        latestChallenge = BinaryPrimitives.ReadUInt16LittleEndian(report[62..]);
+                    report = _device.ReadTimeout(64, 1);
                 }
-
-                if (!hasValidStatus)
-                {
-                    await Task.Delay(500, _cancellationToken);
-                    continue;
-                }
-
-                _crc.Reset();
-                _crc.Append(_deviceSerialNumber);
-                _crc.Append(BitConverter.GetBytes(viveControl.AuthorizationId));
-
-                uint crc = _crc.GetCurrentHashAsUInt32();
-
-                viveControl = new ViveControl(0x04, 0x2978, 0x38, 0x08, crc);
-                var viveData =
-                    MemoryMarshal.Cast<ViveControl, byte>(MemoryMarshal.CreateSpan(ref viveControl, 64))[..64];
-                _device.SendFeatureReport(viveData);
-                
-                await Task.Delay(500, _cancellationToken);
+                if (latestChallenge.HasValue) _device.SendFeatureReport(CreateKeepAlive(serial, latestChallenge.Value));
+                if (_stop.Token.WaitHandle.WaitOne(500)) break;
             }
-            catch (Exception e)
+        }
+        catch (Exception error)
+        {
+            if (!_stop.IsCancellationRequested)
             {
-                Console.WriteLine(e);
+                Interlocked.Exchange(ref _failed, 1);
+                Console.Error.WriteLine($"Vive keep-alive failed: {error.Message}");
             }
         }
     }
-    
-    [StructLayout(LayoutKind.Explicit, Pack = 1, Size = 64)]
-    private unsafe struct ViveControl
+
+    public async ValueTask DisposeAsync()
     {
-        [FieldOffset(0)]
-        public byte ReportId;
-        [FieldOffset(1)]
-        public ushort Command;
-        [FieldOffset(3)]
-        public byte Length;
-        
-        [FieldOffset(10)]
-        public byte Unknown2;
-        
-        [FieldOffset(47)]
-        public fixed byte AuthorizationCode[3];
-
-        [FieldOffset(62)]
-        public ushort AuthorizationId;
-
-        public ViveControl(byte reportId, ushort command, byte length, byte unknown2, uint authorizationCode)
-        {
-            ReportId = reportId;
-            Command = command;
-            Length = length;
-            Unknown2 = unknown2;
-            ToAuthorizationCode(authorizationCode);
-        }
-        
-        private void ToAuthorizationCode(uint crc)
-        {
-            AuthorizationCode[0] = (byte)((crc >> 25) | 0x80);
-            AuthorizationCode[1] = (byte)(crc >> 17);
-            AuthorizationCode[2] = (byte)(crc >> 9);
-        }
+        _stop.Cancel();
+        await _worker;
+        _device.Dispose();
+        _stop.Dispose();
     }
 }

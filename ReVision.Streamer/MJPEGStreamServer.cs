@@ -1,191 +1,144 @@
-﻿using System.Collections.Concurrent;
-using System.Diagnostics.CodeAnalysis;
+using System.Collections.Concurrent;
+using System.Net;
 using System.Text;
+using System.Text.Json;
 using System.Threading.Channels;
-using EmbedIO;
-using EmbedIO.Routing;
-using EmbedIO.WebApi;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using ReVision.Dispatch;
-using ReVision.EyeDevice;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Formats.Jpeg;
-using SixLabors.ImageSharp.PixelFormats;
-using Swan.Logging;
 
 namespace ReVision.Streamer;
 
-public class MJPEGStreamServer
+public sealed record StreamOptions(int Port = 4442, int JpegQuality = 85, int MaxFps = 120);
+
+public sealed class MJPEGStreamServer : IAsyncDisposable
 {
-    [DynamicDependency(DynamicallyAccessedMemberTypes.All, typeof(ImageStreamController))]
-    public MJPEGStreamServer()
+    private readonly record struct StreamKey(ImageDataDispatcher Dispatcher, ImageDataDispatcher.Eye Eye);
+    private readonly ConcurrentDictionary<StreamKey, Lazy<JpegBroadcast>> _streams = new();
+    private readonly IEyeDeviceSource? _devices;
+    private readonly WebApplication _app;
+    private readonly StreamOptions _options;
+    private static readonly byte[] NewLine = "\r\n"u8.ToArray();
+
+    public MJPEGStreamServer(IEyeDeviceSource? devices, StreamOptions? options = null)
     {
-        var server = new WebServer(o => o
-            .WithUrlPrefix("http://127.0.0.1:4442/")
-            .WithMode(HttpListenerMode.Microsoft)
-        ).WithWebApi("/", m => m.WithController<ImageStreamController>());
-        
-        server.StateChanged += (s, e) => $"WebServer New State - {e.NewState}".Info();
-        server.RunAsync();
+        _devices = devices;
+        _options = options ?? new StreamOptions();
+        if (_options.Port is < 1024 or > 65535) throw new ArgumentOutOfRangeException(nameof(options));
+        if (_options.JpegQuality is < 1 or > 100 || _options.MaxFps is < 1 or > 240) throw new ArgumentOutOfRangeException(nameof(options));
+        var builder = WebApplication.CreateSlimBuilder();
+        builder.Logging.ClearProviders();
+        builder.Logging.AddSimpleConsole(o => { o.SingleLine = true; o.TimestampFormat = "HH:mm:ss "; });
+        builder.Logging.SetMinimumLevel(LogLevel.Warning);
+        builder.WebHost.ConfigureKestrel(server =>
+        {
+            server.Listen(IPAddress.Loopback, _options.Port);
+            server.Limits.MaxConcurrentConnections = 32;
+            server.Limits.MaxRequestBodySize = 0;
+            server.AddServerHeader = false;
+        });
+        _app = builder.Build();
+        _app.Use(async (context, next) =>
+        {
+            string host = context.Request.Host.Host;
+            if (host != "127.0.0.1" && !host.Equals("localhost", StringComparison.OrdinalIgnoreCase))
+            { context.Response.StatusCode = 400; return; }
+            context.Response.Headers.CacheControl = "no-store";
+            context.Response.Headers.XContentTypeOptions = "nosniff";
+            context.Response.Headers["Cross-Origin-Resource-Policy"] = "same-origin";
+            context.Response.Headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; frame-ancestors 'none'";
+            await next(context);
+        });
+        _app.MapGet("/", () => Results.Content(Assets.Read("index.html"), "text/html"));
+        _app.MapGet("/app.js", () => Results.Content(Assets.Read("app.js"), "text/javascript"));
+        _app.MapGet("/style.css", () => Results.Content(Assets.Read("style.css"), "text/css"));
+        _app.MapGet("/health", () => Json(new { status = "ok", cameraVerified = Snapshots().Any(d => d.IsStreaming) }));
+        _app.MapGet("/devices", () => Json(Snapshots()));
+        _app.MapGet("/{device}/image/{eye}", StreamImageAsync);
     }
-    
-    internal class ImageStreamController : WebApiController
+
+    private DeviceSnapshot[] Snapshots() => _devices?.GetDeviceSnapshots(_options.Port) ?? [];
+    private static IResult Json<T>(T value) => Results.Text(JsonSerializer.Serialize(value), "application/json");
+
+    public async Task RunAsync(CancellationToken token)
     {
-        private static byte[] WriteBoundary(int contentLength)
+        await _app.StartAsync(token);
+        using var maintenanceStop = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var maintenance = MaintainAsync(maintenanceStop.Token);
+        try { await _app.WaitForShutdownAsync(token); }
+        finally
         {
-            var builder = new StringBuilder();
-
-            builder.Append("--");
-            builder.Append("frame-boundary");
-            builder.Append("\r\n");
-
-            builder.Append("Content-Type: image/jpeg");
-            builder.Append("\r\n");
-
-            builder.AppendFormat("Content-Length: {0}", contentLength);
-            builder.Append("\r\n");
-            builder.Append("\r\n");
-
-            return Encoding.ASCII.GetBytes(builder.ToString());
+            maintenanceStop.Cancel();
+            try { await maintenance; } catch (OperationCanceledException) when (maintenanceStop.IsCancellationRequested) { }
         }
-        
-        [Route(HttpVerbs.Get, "/{device}/image/left")]
-        public async Task SubscribeImageStreamLeft()
+    }
+
+    private async Task MaintainAsync(CancellationToken token)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
+        while (await timer.WaitForNextTickAsync(token))
+            foreach (var item in _streams)
+                if (item.Key.Dispatcher.Disposed && _streams.TryRemove(item.Key, out var stream) && stream.IsValueCreated)
+                    await stream.Value.DisposeAsync();
+    }
+
+    private async Task StreamImageAsync(HttpContext context, string device, string eye)
+    {
+        ImageDataDispatcher.Eye source;
+        if (eye == "left") source = ImageDataDispatcher.Eye.Left;
+        else if (eye == "right") source = ImageDataDispatcher.Eye.Right;
+        else { context.Response.StatusCode = 404; return; }
+        if (_devices == null || !_devices.GetImageDataDispatcher(device, out var dispatcher) || dispatcher.Disposed)
+        { context.Response.StatusCode = 404; return; }
+        JpegBroadcast.Client viewer;
+        try
         {
-            var eyeDeviceManager = StreamServerManager.Get().GetEyeDeviceManager();
-            if (!eyeDeviceManager.GetImageDataDispatcher(Route["device"], out var imageDataDispatcher))
-            {
-                HttpContext.Response.StatusCode = 404;
-                return;
-            }
-            
-            HttpContext.Response.SendChunked = true;
-            HttpContext.Response.ContentType = "multipart/x-mixed-replace; boundary=frame-boundary";
-            var dataStream = HttpContext.OpenResponseStream(false, false);
-
-            Channel<byte[]> pixelDataChannel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(16)
-            {
-                FullMode = BoundedChannelFullMode.DropOldest,
-            });
-            
-            void FeedImage(ImageDataDispatcher.Eye eye, byte[] data)
-            {
-                if (eye != ImageDataDispatcher.Eye.Left)
-                    return;
-                
-                // Convert Luminance data to Rgba32
-                byte[] convertedPixels = new byte[200 * 200 * 4];
-                for (int y = 0; y < 200; y++)
-                {
-                    for (int x = 0; x < 200; x++)
-                    {
-                        byte grayscaleValue = data[y * 200 + x];
-                                
-                        int index = (y * 200 + x) * 4;
-                        convertedPixels[index + 0] = grayscaleValue; // R
-                        convertedPixels[index + 1] = grayscaleValue; // G
-                        convertedPixels[index + 2] = grayscaleValue; // B
-                        convertedPixels[index + 3] = 255; // A (fully opaque)
-                    }
-                }
-                
-                pixelDataChannel.Writer.TryWrite(convertedPixels);
-            }
-            
-            imageDataDispatcher.Register(FeedImage);
-            
-            while (dataStream.CanWrite)
-            {
-                await foreach (byte[] pixelData in pixelDataChannel.Reader.ReadAllAsync())
-                {
-                    using Image<Rgba32> image = Image.LoadPixelData<Rgba32>(pixelData, 200, 200);
-                    using MemoryStream memoryStream = new MemoryStream();
-                    await image.SaveAsJpegAsync(memoryStream);
-
-                    try
-                    {
-                        await dataStream.WriteAsync(WriteBoundary((int)memoryStream.Length));
-                        memoryStream.Position = 0;
-                        await memoryStream.CopyToAsync(dataStream);
-                        await dataStream.FlushAsync();
-                    }
-                    catch (Exception)
-                    {
-                        // ignored
-                    }
-                }
-            }
-            
-            imageDataDispatcher.Unregister(FeedImage);
+            var stream = _streams.GetOrAdd(new StreamKey(dispatcher, source), key =>
+                new Lazy<JpegBroadcast>(() => new JpegBroadcast(key.Dispatcher, key.Eye, _options.JpegQuality, _options.MaxFps)));
+            viewer = stream.Value.Subscribe();
         }
-        
-        [Route(HttpVerbs.Get, "/{device}/image/right")]
-        public async Task SubscribeImageStreamRight()
+        catch (ObjectDisposedException) { context.Response.StatusCode = 503; return; }
+        catch (InvalidOperationException) { context.Response.StatusCode = 429; return; }
+        using (viewer)
+        using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, _app.Lifetime.ApplicationStopping))
         {
-            var eyeDeviceManager = StreamServerManager.Get().GetEyeDeviceManager();
-            if (!eyeDeviceManager.GetImageDataDispatcher(Route["device"], out var imageDataDispatcher))
+            context.Response.ContentType = "multipart/x-mixed-replace; boundary=frame-boundary";
+            try
             {
-                HttpContext.Response.StatusCode = 404;
-                return;
-            }
-            
-            HttpContext.Response.SendChunked = true;
-            HttpContext.Response.ContentType = "multipart/x-mixed-replace; boundary=frame-boundary";
-            var dataStream = HttpContext.OpenResponseStream(false, false);
-
-            Channel<byte[]> pixelDataChannel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(16)
-            {
-                FullMode = BoundedChannelFullMode.DropOldest,
-            });
-            
-            void FeedImage(ImageDataDispatcher.Eye eye, byte[] data)
-            {
-                if (eye != ImageDataDispatcher.Eye.Right)
-                    return;
-                
-                // Convert Luminance data to Rgba32
-                byte[] convertedPixels = new byte[200 * 200 * 4];
-                for (int y = 0; y < 200; y++)
+                while (!timeout.IsCancellationRequested)
                 {
-                    for (int x = 0; x < 200; x++)
-                    {
-                        byte grayscaleValue = data[y * 200 + x];
-                                
-                        int index = (y * 200 + x) * 4;
-                        convertedPixels[index + 0] = grayscaleValue; // R
-                        convertedPixels[index + 1] = grayscaleValue; // G
-                        convertedPixels[index + 2] = grayscaleValue; // B
-                        convertedPixels[index + 3] = 255; // A (fully opaque)
-                    }
-                }
-                
-                pixelDataChannel.Writer.TryWrite(convertedPixels);
-            }
-            
-            imageDataDispatcher.Register(FeedImage);
-            
-            while (dataStream.CanWrite)
-            {
-                await foreach (byte[] pixelData in pixelDataChannel.Reader.ReadAllAsync())
-                {
-                    using Image<Rgba32> image = Image.LoadPixelData<Rgba32>(pixelData, 200, 200);
-                    using MemoryStream memoryStream = new MemoryStream();
-                    await image.SaveAsJpegAsync(memoryStream);
-
-                    try
-                    {
-                        await dataStream.WriteAsync(WriteBoundary((int)memoryStream.Length));
-                        memoryStream.Position = 0;
-                        await memoryStream.CopyToAsync(dataStream);
-                        await dataStream.FlushAsync();
-                    }
-                    catch (Exception)
-                    {
-                        // ignored
-                    }
+                    timeout.CancelAfter(TimeSpan.FromSeconds(10));
+                    byte[] jpeg = await viewer.Frames.ReadAsync(timeout.Token);
+                    byte[] header = Encoding.ASCII.GetBytes($"--frame-boundary\r\nContent-Type: image/jpeg\r\nContent-Length: {jpeg.Length}\r\n\r\n");
+                    await context.Response.Body.WriteAsync(header, timeout.Token);
+                    await context.Response.Body.WriteAsync(jpeg, timeout.Token);
+                    await context.Response.Body.WriteAsync(NewLine, timeout.Token);
+                    await context.Response.Body.FlushAsync(timeout.Token);
                 }
             }
-            
-            imageDataDispatcher.Unregister(FeedImage);
+            catch (OperationCanceledException) { }
+            catch (IOException) { }
+            catch (ChannelClosedException) { }
         }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await _app.DisposeAsync();
+        foreach (var stream in _streams.Values) if (stream.IsValueCreated) await stream.Value.DisposeAsync();
+    }
+
+    private static class Assets
+    {
+        private static readonly ConcurrentDictionary<string, string> Cache = new();
+        internal static string Read(string name) => Cache.GetOrAdd(name, static key =>
+        {
+            using var stream = typeof(MJPEGStreamServer).Assembly.GetManifestResourceStream("ReVision.Streamer.Web." + key)!;
+            using var reader = new StreamReader(stream);
+            return reader.ReadToEnd();
+        });
     }
 }

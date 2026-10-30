@@ -1,0 +1,53 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 10.0.403
+      - name: Build and test
+        run: dotnet test ReVision.Tests/ReVision.Tests.csproj -c Release --artifacts-path .local/artifacts/check -p:RestoreLockedMode=true --logger trx --results-directory artifacts/test-results
+      - name: Formatting
+        run: dotnet format whitespace ReVision.sln --exclude LibUsbDotNet --verify-no-changes --verbosity quiet
+      - name: Process lifecycle
+        run: python scripts/smoke.py .local/artifacts/check/bin/ReVision/release/ReVision.dll
+      - name: Dependency audit
+        run: python scripts/audit.py ReVision.Tests/ReVision.Tests.csproj
+      - name: Linux scripts
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          for script in build-linux.sh run-linux.sh linux/*.sh; do bash -n "$script"; done
+          udevadm verify linux/70-revision-vive-pro-eye.rules
+      - name: PowerShell syntax
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse -Filter *.ps1 | Where-Object FullName -NotMatch '[\/]LibUsbDotNet[\/]|[\/]\.local[\/]' | ForEach-Object {
+            $errors = $null
+            $tokens = $null
+            [Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors) { throw ($errors | Out-String) }
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: tests-${{ matrix.os }}
+          path: artifacts/test-results

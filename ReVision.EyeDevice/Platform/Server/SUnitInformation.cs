@@ -1,4 +1,4 @@
-﻿namespace ReVision.EyeDevice.Platform.Server;
+namespace ReVision.EyeDevice.Platform.Server;
 
 public class SUnitInformation : BasePacket
 {
@@ -6,7 +6,7 @@ public class SUnitInformation : BasePacket
     public string DeviceModel { get; private init; }
     public string DeviceLine { get; private init; }
     public string FirmwareVersion { get; private init; }
-    
+
     public SUnitInformation(Stream stream) : base(stream)
     {
         SerialNumber = this.DecodeString();
@@ -14,7 +14,7 @@ public class SUnitInformation : BasePacket
         DeviceLine = this.DecodeString();
         FirmwareVersion = this.DecodeString();
     }
-    
+
     public override string ToString()
     {
         return

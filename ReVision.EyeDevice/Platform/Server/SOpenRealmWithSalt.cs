@@ -1,4 +1,4 @@
-﻿namespace ReVision.EyeDevice.Platform.Server;
+namespace ReVision.EyeDevice.Platform.Server;
 
 public class SOpenRealmWithSalt : BasePacket
 {

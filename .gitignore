@@ -1,5 +1,11 @@
-bin/
-obj/
-/packages/
-riderModule.iml
+**/bin/
+**/obj/
+/.local/
+/artifacts/
+/logs/
+/.idea/
+/.vs/
 /_ReSharper.Caches/
+*.user
+*.suo
+*.iml

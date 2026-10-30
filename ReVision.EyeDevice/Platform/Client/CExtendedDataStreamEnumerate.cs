@@ -1,4 +1,4 @@
-﻿namespace ReVision.EyeDevice.Platform.Client;
+namespace ReVision.EyeDevice.Platform.Client;
 
 public class CExtendedDataStreamEnumerate : BasePacket, IBinaryOutput
 {
@@ -6,8 +6,7 @@ public class CExtendedDataStreamEnumerate : BasePacket, IBinaryOutput
     {
     }
 
-    public bool Encode()
+    void IBinaryOutput.WriteBody()
     {
-        return true;
     }
 }

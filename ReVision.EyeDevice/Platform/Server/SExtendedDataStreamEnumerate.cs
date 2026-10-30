@@ -1,11 +1,11 @@
-﻿using System.Text;
+using System.Text;
 
 namespace ReVision.EyeDevice.Platform.Server;
 
 public class SExtendedDataStreamEnumerate : BasePacket
 {
     public IReadOnlyList<ExtendedDataStreamDescription> DataStreamDescriptions { get; private init; }
-    
+
     public SExtendedDataStreamEnumerate(Stream stream) : base(stream)
     {
         var dataStreamDescriptions = new List<ExtendedDataStreamDescription>();
@@ -14,10 +14,10 @@ public class SExtendedDataStreamEnumerate : BasePacket
         for (int i = 0; i < entryCount; i++)
         {
             var prologue = this.DecodePrologue();
-            
+
             if (prologue != (uint)PrologueType.EXTENDED_DATA_STREAM_ENUMERATION)
                 throw new InvalidDataException($"Expected type {(uint)PrologueType.EXTENDED_DATA_STREAM_ENUMERATION} but got {prologue}");
-            
+
             dataStreamDescriptions.Add(new ExtendedDataStreamDescription
             {
                 OpCode = this.DecodeUInt32(),
@@ -26,10 +26,10 @@ public class SExtendedDataStreamEnumerate : BasePacket
                 FeatureLock = this.DecodeUInt32()
             });
         }
-        
+
         DataStreamDescriptions = dataStreamDescriptions;
     }
-    
+
     public override string ToString()
     {
         var sb = new StringBuilder();
@@ -58,8 +58,8 @@ public class SExtendedDataStreamEnumerate : BasePacket
     public class ExtendedDataStreamDescription
     {
         public uint OpCode { get; internal init; }
-        public string Description { get; internal init; }
-        public string Unknown1 { get; internal init; }
+        public string Description { get; internal init; } = "";
+        public string Unknown1 { get; internal init; } = "";
         public uint FeatureLock { get; internal init; }
     }
 }

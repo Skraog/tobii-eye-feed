@@ -1,0 +1,7 @@
+# Allow the active local desktop user to access only Vive Pro Eye interfaces.
+# Vive USB parent: reading its serial descriptor for the HID keep-alive.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bb4", ATTR{idProduct}=="0309", MODE="0660", TAG+="uaccess"
+# HIDAPI uses hidraw on Linux; leave the kernel HID driver attached.
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="0bb4", ATTRS{idProduct}=="0309", MODE="0660", TAG+="uaccess"
+# Internal Vive Pro Eye EyeChip cameras.
+SUBSYSTEM=="usb", ATTR{idVendor}=="2104", ATTR{idProduct}=="020f", MODE="0660", TAG+="uaccess"

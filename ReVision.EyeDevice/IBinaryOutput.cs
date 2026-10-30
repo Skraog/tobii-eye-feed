@@ -1,6 +1,6 @@
-﻿namespace ReVision.EyeDevice;
+namespace ReVision.EyeDevice;
 
 public interface IBinaryOutput
 {
-    public bool Encode();
+    void WriteBody();
 }

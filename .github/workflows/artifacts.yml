@@ -1,0 +1,47 @@
+name: Release artifacts
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  package:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            runtime: win-x64
+          - os: ubuntu-latest
+            runtime: linux-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 10.0.403
+      - name: Tests
+        run: dotnet test ReVision.Tests/ReVision.Tests.csproj -c Release --artifacts-path .local/artifacts/check -p:RestoreLockedMode=true
+      - name: Package
+        shell: pwsh
+        run: ./scripts/Package.ps1 -Runtime ${{ matrix.runtime }}
+      - name: Corresponding source
+        if: runner.os == 'Linux'
+        run: python scripts/source_archive.py artifacts/tobii-eye-feed-source.tar.gz
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem artifacts -File | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(),$_.Name
+          } | Set-Content artifacts/SHA256SUMS-${{ matrix.runtime }}.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tobii-eye-feed-${{ matrix.runtime }}
+          path: |
+            artifacts/*.zip
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS-*.txt

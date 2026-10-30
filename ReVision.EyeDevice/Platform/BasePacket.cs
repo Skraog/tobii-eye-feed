@@ -1,97 +1,59 @@
-﻿using System.Buffers.Binary;
-using System.Runtime.Serialization;
+using System.Buffers.Binary;
 
 namespace ReVision.EyeDevice.Platform;
 
 public class BasePacket
 {
-    internal Stream _stream;
-    
-    private MessageDirection _direction;
-    private uint _packetLength;
-    private uint _messageType;
-    private uint _messageId;
-    private OpCode _opCode;
-    private uint _statusCode;
-    private uint _bodyLength;
-    
-    public uint MessageId => _messageId;
-    public OpCode OpCode => _opCode;
-    public uint StatusCode => _statusCode;
-    
+    internal readonly Stream _stream;
+    private readonly bool _outgoing;
+    public uint MessageId { get; }
+    public OpCode OpCode { get; }
+    public uint StatusCode { get; }
+    public uint MessageType { get; }
+
     internal BasePacket(uint messageId, OpCode opCode)
     {
         _stream = new MemoryStream();
-        
-        _messageId = messageId;
-        _messageType = 81; // ???
-        _opCode = opCode;
-        
-        WriteHeader();
+        _outgoing = true;
+        MessageId = messageId;
+        OpCode = opCode;
     }
-    
+
     public BasePacket(Stream stream)
     {
         _stream = stream;
-        
-        _direction = (MessageDirection)this.ReadUInt32LE();
-        _packetLength = this.ReadUInt32LE();
-        _messageType = this.ReadUInt32BE();
-        _messageId = this.ReadUInt32BE();
+        if (stream.Length is < 32 or > PacketFramer.MaxPacketBytes)
+            throw new InvalidDataException("Invalid packet size.");
+        _ = this.ReadUInt32LE(); // Direction.
+        uint length = this.ReadUInt32LE();
+        if (length != stream.Length)
+            throw new InvalidDataException("Packet length does not match its transport header.");
+        MessageType = this.ReadUInt32BE();
+        MessageId = this.ReadUInt32BE();
         _ = this.ReadUInt32BE();
-        _opCode = (OpCode)this.ReadUInt32BE();
-        _statusCode = this.ReadUInt32BE();
-        _bodyLength = this.ReadUInt32BE();
-
-        if (Available(2))
-            _ = this.ReadUInt16BE();
-    }
-
-    public static bool IsFullPacket(byte[] packet, out uint packetLength)
-    {
-        packetLength = BinaryPrimitives.ReadUInt32LittleEndian(packet.AsSpan()[4..]);
-        return packetLength == packet.Length;
-    }
-
-    private bool Available(uint byteAmount)
-    {
-        return _stream.Length - _stream.Position >= byteAmount;
-    }
-
-    private void WriteHeader()
-    {
-        _stream.Seek(0, SeekOrigin.Begin);
-        
-        this.WriteUInt32LE((uint)_direction);
-        this.WriteUInt32LE(_packetLength);
-        this.WriteUInt32BE(_messageType);
-        this.WriteUInt32BE(_messageId);
-        this.WriteUInt32BE(0);
-        this.WriteUInt32BE((uint)_opCode);
-        this.WriteUInt32BE(_statusCode);
-        this.WriteUInt32BE(_bodyLength);
-        this.WriteUInt16BE(0);
+        OpCode = (OpCode)this.ReadUInt32BE();
+        StatusCode = this.ReadUInt32BE();
+        uint bodyLength = this.ReadUInt32BE();
+        if (bodyLength > stream.Length - stream.Position)
+            throw new InvalidDataException("Packet body extends beyond the transport frame.");
+        if (bodyLength >= 2) _ = this.ReadUInt16BE();
     }
 
     public byte[] Encode()
     {
-        var headerLength = (uint)_stream.Position;
-        
-        IBinaryOutput binaryOutput = (IBinaryOutput)this;
-        if (!binaryOutput.Encode())
-            throw new SerializationException("Can't encode packet");
-
-        uint streamPosition = (uint)_stream.Position;
-
-        _packetLength = streamPosition - 8;
-        _bodyLength = (_packetLength - headerLength) + 10;
-        
-        WriteHeader();
-        _stream.Seek(0, SeekOrigin.Begin);
-        
-        byte[] packet = new byte[streamPosition];
-        _stream.ReadExactly(packet, 0, (int)streamPosition);
-
+        if (!_outgoing || this is not IBinaryOutput body)
+            throw new InvalidOperationException("Only command packets can be encoded.");
+        _stream.SetLength(34);
+        _stream.Position = 34;
+        body.WriteBody();
+        int length = checked((int)_stream.Position);
+        byte[] packet = ((MemoryStream)_stream).ToArray();
+        BinaryPrimitives.WriteUInt32LittleEndian(packet, 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(4), (uint)length - 8);
+        BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(8), 81);
+        BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(12), MessageId);
+        BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(20), (uint)OpCode);
+        BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(28), (uint)length - 32);
         return packet;
     }
 }

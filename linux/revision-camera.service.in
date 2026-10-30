@@ -1,0 +1,15 @@
+[Unit]
+Description=Vive Pro Eye camera passthrough
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=@ROOT@
+ExecStart=/usr/bin/bash "@ROOT@/run-linux.sh"
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=graphical-session.target
